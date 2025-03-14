@@ -208,6 +208,8 @@ async def load_inline_model(model_name: str, request: Request):
                 
                 if not active_job_ids:
                     logger.info(f"All active generations completed. Proceeding with model switch to '{model_name}'.")
+                    # Add a small delay to ensure generators are fully closed before unloading
+                    await asyncio.sleep(0.5)
                     break
                     
                 # Add periodic logging

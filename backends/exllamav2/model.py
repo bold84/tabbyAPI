@@ -538,12 +538,23 @@ class ExllamaV2Container:
             )
 
             # Requires a copy to avoid errors during iteration
-            jobs_copy = self.generator.jobs.copy()
-            for job in jobs_copy.values():
-                await job.cancel()
-
-        while self.generator.jobs:
-            await asyncio.sleep(0.01)
+            if hasattr(self.generator, "jobs"):
+                jobs_copy = self.generator.jobs.copy()
+                cancel_tasks = []
+                for job in jobs_copy.values():
+                    cancel_tasks.append(asyncio.create_task(job.cancel()))
+                
+                if cancel_tasks:
+                    await asyncio.gather(*cancel_tasks)
+                    # Add a small delay to ensure cleanup completes
+                    await asyncio.sleep(0.5)
+        else:
+            # Wait for all jobs to complete naturally
+            while self.generator and hasattr(self.generator, "jobs") and self.generator.jobs:
+                await asyncio.sleep(0.1)
+            
+            # Add a small delay to ensure cleanup completes even for natural completion
+            await asyncio.sleep(0.5)
 
     async def load(self, progress_callback=None):
         """
@@ -815,20 +826,30 @@ class ExllamaV2Container:
                 # Immediately cancel all jobs
                 await self.wait_for_jobs(skip_wait=True)
 
-            # Create new generator
-            self.generator = ExLlamaV2DynamicGeneratorAsync(
-                model=self.model,
-                cache=self.cache,
-                draft_model=self.draft_model,
-                draft_cache=self.draft_cache,
-                tokenizer=self.tokenizer,
-                max_batch_size=self.max_batch_size,
-                paged=self.paged,
-            )
+            # Ensure we have the necessary components before creating generator
+            if not self.model or not self.cache or not self.tokenizer:
+                logger.error("Cannot create generator: model components are not loaded")
+                return
+                
+            # Create new generator with appropriate error handling
+            try:
+                self.generator = ExLlamaV2DynamicGeneratorAsync(
+                    model=self.model,
+                    cache=self.cache,
+                    draft_model=self.draft_model,
+                    draft_cache=self.draft_cache,
+                    tokenizer=self.tokenizer,
+                    max_batch_size=self.max_batch_size,
+                    paged=self.paged,
+                )
 
-            # Update the state of the container var
-            if self.max_batch_size is None:
-                self.max_batch_size = self.generator.generator.max_batch_size
+                # Update the state of the container var
+                if self.max_batch_size is None:
+                    self.max_batch_size = self.generator.generator.max_batch_size
+            except Exception as e:
+                logger.error(f"Failed to create generator: {str(e)}")
+                self.generator = None
+                raise
         finally:
             # This means the generator is being recreated
             # The load lock is already released in the load function
@@ -918,47 +939,59 @@ class ExllamaV2Container:
 
             # Unload the entire model if not just unloading loras
             if not loras_only:
-                if self.model:
-                    self.model.unload()
+                # Store temporary references of objects before nullifying them
+                temp_model = self.model
+                temp_vision_model = self.vision_model
+                temp_draft_model = self.draft_model
+                temp_generator = self.generator
+                
+                # Nullify references first to prevent any new accesses
                 self.model = None
-
-                if self.vision_model:
-                    # TODO: Remove this with newer exl2 versions
-                    # Required otherwise unload function won't finish
-                    try:
-                        self.vision_model.unload()
-                    except AttributeError:
-                        pass
-
                 self.vision_model = None
-
-                if self.draft_model:
-                    self.draft_model.unload()
                 self.draft_model = None
-
                 self.config = None
                 self.cache = None
                 self.tokenizer = None
-
-                # Cleanup the generator from any pending jobs
-                if self.generator is not None:
-                    await self.generator.close()
-                    self.generator = None
-
-                # Set all model state variables to False
+                
+                # Set all model state variables to False before actual unloading
                 self.model_is_loading = False
                 self.model_loaded = False
+                
+                # Cleanup the generator from any pending jobs first
+                if temp_generator is not None:
+                    await temp_generator.close()
+                    # Explicitly set to None after closing
+                    self.generator = None
 
-            gc.collect()
-            torch.cuda.empty_cache()
+                # Then clean up the actual model objects
+                if temp_model:
+                    temp_model.unload()
+                    
+                if temp_vision_model:
+                    # TODO: Remove this with newer exl2 versions
+                    # Required otherwise unload function won't finish
+                    try:
+                        temp_vision_model.unload()
+                    except AttributeError:
+                        pass
 
-            logger.info("Loras unloaded." if loras_only else "Model unloaded.")
+                if temp_draft_model:
+                    temp_draft_model.unload()
+
+                # Run garbage collection after explicitly nullifying references
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                logger.info("Model unloaded.")
+            else:
+                logger.info("Loras unloaded.")
         finally:
             if not do_shutdown:
                 self.load_lock.release()
 
                 async with self.load_condition:
                     self.load_condition.notify_all()
+
 
     def encode_tokens(self, text: str, **kwargs):
         """Wrapper to encode tokens from a text string."""
@@ -1103,6 +1136,12 @@ class ExllamaV2Container:
         # Wait for load lock to be freed before processing
         async with self.load_condition:
             await self.load_condition.wait_for(lambda: not self.load_lock.locked())
+
+        # Safety check - verify model components are available
+        if not self.model or not self.tokenizer or not self.generator:
+            error_message = "Cannot generate: model, tokenizer, or generator is not available"
+            logger.error(error_message)
+            raise RuntimeError(error_message)
 
         prompts = [prompt]
 
