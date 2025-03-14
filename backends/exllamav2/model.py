@@ -36,6 +36,7 @@ from typing import List, Optional, Union
 from ruamel.yaml import YAML
 
 from common.health import HealthManager
+from common.logger import get_loading_progress_bar
 
 from backends.exllamav2.grammar import (
     ExLlamaV2Grammar,
@@ -568,32 +569,61 @@ class ExllamaV2Container:
             await self.load_lock.acquire()
             self.model_is_loading = True
 
+            # Remove API request flag from kwargs to avoid passing it to other functions
+            is_api_request = kwargs.pop("is_api_request", False)
+
             # Wait for existing generation jobs to finish
             await self.wait_for_jobs(kwargs.get("skip_wait"))
 
             # Streaming gen for model load progress
             model_load_generator = self.load_model_sync(progress_callback)
-            async for value in iterate_in_threadpool(model_load_generator):
-                yield value
-
-            # Create async generator
-            await self.create_generator()
-
-            # Clean up any extra vram usage from torch and cuda
-            # (Helps reduce VRAM bottlenecking on Windows)
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # Cleanup and update model load state
-            self.model_loaded = True
-            logger.info("Model successfully loaded.")
+            
+            progress = None
+            try:
+                # Only create and use progress bar for non-API requests
+                if not is_api_request:
+                    progress = get_loading_progress_bar()
+                    progress.start()
+                
+                async for value in iterate_in_threadpool(model_load_generator):
+                    yield value
+                
+                # Create async generator
+                await self.create_generator()
+                
+                # Clean up any extra vram usage from torch and cuda
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                # Cleanup and update model load state
+                self.model_loaded = True
+                logger.info("Model successfully loaded.")
+            except Exception as e:
+                logger.error(f"Error loading model: {str(e)}")
+                # Attempt to clean up any partially loaded model
+                try:
+                    if self.model:
+                        self.model.unload()
+                    if self.draft_model:
+                        self.draft_model.unload()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                except Exception as cleanup_error:
+                    logger.error(f"Error during cleanup: {str(cleanup_error)}")
+                raise e
+            finally:
+                if progress:
+                    progress.stop()
+        except Exception as e:
+            self.model_is_loading = False
+            raise e
         finally:
             self.load_lock.release()
             self.model_is_loading = False
 
             async with self.load_condition:
                 self.load_condition.notify_all()
-
+                
     @torch.inference_mode()
     def load_model_sync(self, progress_callback=None):
         """

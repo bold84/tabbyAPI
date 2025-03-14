@@ -68,6 +68,9 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
     # Merge with config defaults
     kwargs = {**config.model_defaults, **kwargs}
 
+    # Add an API request flag to determine if progress bar should be shown
+    is_api_request = kwargs.pop("is_api_request", False)
+
     # Create a new container
     container = await ExllamaV2Container.create(model_path.resolve(), False, **kwargs)
 
@@ -80,35 +83,50 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
     if container.draft_config:
         model_type.insert(0, ModelType.DRAFT)
 
-    load_status = container.load_gen(load_progress, **kwargs)
+    # Pass the API request flag to load_gen
+    load_status = container.load_gen(load_progress, is_api_request=is_api_request, **kwargs)
 
-    progress = get_loading_progress_bar()
-    progress.start()
-
+    progress = None
     try:
+        # Only create progress bar for non-API requests
+        if not is_api_request:
+            progress = get_loading_progress_bar()
+            progress.start()
+
         index = 0
         async for module, modules in load_status:
             current_model_type = model_type[index].value
             if module == 0:
-                loading_task = progress.add_task(
-                    f"[cyan]Loading {current_model_type} modules", total=modules
-                )
+                if progress:  # Only update progress if it exists
+                    loading_task = progress.add_task(
+                        f"[cyan]Loading {current_model_type} modules", total=modules
+                    )
             else:
-                progress.advance(loading_task)
+                if progress:  # Only update progress if it exists
+                    progress.advance(loading_task)
 
             yield module, modules, current_model_type
 
             if module == modules:
                 # Switch to model progress if the draft model is loaded
-                if index == len(model_type):
-                    progress.stop()
+                if index == len(model_type) - 1:
+                    pass  # Progress will be stopped in finally
                 else:
                     index += 1
+    except Exception as e:
+        logger.error(f"Error during model loading: {str(e)}")
+        if container:
+            try:
+                await container.unload(skip_wait=True)
+            except Exception as unload_error:
+                logger.error(f"Error during cleanup: {str(unload_error)}")
+        raise
     finally:
-        progress.stop()
-
+        if progress:
+            progress.stop()
 
 async def load_model(model_path: pathlib.Path, **kwargs):
+    """Wrapper to load a model synchronously."""
     async for _ in load_model_gen(model_path, **kwargs):
         pass
 

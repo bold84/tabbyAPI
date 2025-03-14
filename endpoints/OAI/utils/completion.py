@@ -148,15 +148,97 @@ async def load_inline_model(model_name: str, request: Request):
         else:
             return
 
-    # Start inline loading
-    # Past here, user is assumed to be admin
-
     # Skip if the model is a dummy
     if is_dummy_model:
         logger.warning(f"Dummy model {model_name} provided. Skipping inline load.")
-
         return
 
+    # Check if a model is already loading
+    if model.container and model.container.model_is_loading:
+        current_model_name = "unknown"
+        if model.container.model_dir:
+            current_model_name = model.container.model_dir.name
+            
+        error_message = handle_request_error(
+            f"Cannot switch to model '{model_name}' because model '{current_model_name}' is currently loading. "
+            "Please try again later.",
+            exc_info=False,
+        ).error.message
+        raise HTTPException(503, error_message)
+
+    # Check if active generations are in progress
+    active_jobs = {}
+    if model.container and model.container.generator and hasattr(model.container.generator, "jobs"):
+        active_jobs = model.container.generator.jobs
+        
+    if active_jobs:
+        current_model_name = model.container.model_dir.name
+        job_count = len(active_jobs)
+        
+        logger.info(f"Model switch request detected {job_count} active generation jobs")
+        
+        # Check if we should queue or reject based on config setting
+        if not config.model.queue_model_switch_requests:
+            # Reject with error
+            error_message = handle_request_error(
+                f"Cannot switch models while active generations are in progress with model '{current_model_name}'. "
+                f"Requested model '{model_name}' will not be loaded. Please try again later.",
+                exc_info=False,
+            ).error.message
+            raise HTTPException(503, error_message)
+        else:
+            # Wait for active jobs WITHOUT holding the load_lock
+            logger.info(
+                f"Request to switch from '{current_model_name}' to '{model_name}' is waiting for "
+                f"{job_count} active generations to complete."
+            )
+            
+            # Create a copy of active job IDs
+            active_job_ids = list(active_jobs.keys())
+            
+            # Wait for all active jobs to complete (with timeout protection)
+            max_wait_time = 300  # 5 minutes max wait
+            start_time = asyncio.get_event_loop().time()
+            
+            while active_job_ids and (asyncio.get_event_loop().time() - start_time < max_wait_time):
+                # Get current jobs
+                current_jobs = getattr(model.container.generator, "jobs", {})
+                # Update active job IDs by checking which are still in the generator's jobs dict
+                active_job_ids = [job_id for job_id in active_job_ids if job_id in current_jobs]
+                
+                if not active_job_ids:
+                    logger.info(f"All active generations completed. Proceeding with model switch to '{model_name}'.")
+                    break
+                    
+                # Add periodic logging
+                if (asyncio.get_event_loop().time() - start_time) % 10 < 0.1:  # Log every ~10 seconds
+                    logger.info(f"Still waiting for {len(active_job_ids)} generation jobs to complete...")
+                    
+                await asyncio.sleep(0.1)  # Short sleep to prevent CPU spinning
+                
+            # If we timed out
+            if active_job_ids:
+                error_message = handle_request_error(
+                    f"Timed out waiting for active generations to complete. "
+                    f"Cannot switch from '{current_model_name}' to '{model_name}'.",
+                    exc_info=False,
+                ).error.message
+                raise HTTPException(504, error_message)  # 504 Gateway Timeout
+
+    # Force a re-check of active jobs to ensure nothing started while we were waiting
+    if hasattr(model.container, "generator") and hasattr(model.container.generator, "jobs"):
+        active_jobs = model.container.generator.jobs
+        if active_jobs:
+            job_count = len(active_jobs)
+            current_model_name = model.container.model_dir.name
+            error_message = handle_request_error(
+                f"New generations started while waiting for switch. "
+                f"Cannot switch from '{current_model_name}' to '{model_name}' "
+                f"with {job_count} active jobs.",
+                exc_info=False,
+            ).error.message
+            raise HTTPException(503, error_message)
+    
     model_path = pathlib.Path(config.model.model_dir)
     model_path = model_path / model_name
 
@@ -165,15 +247,23 @@ async def load_inline_model(model_name: str, request: Request):
         logger.warning(
             f"Could not find model path {str(model_path)}. Skipping inline model load."
         )
-
         return
 
-    # Load the model and also add draft dir
-    await model.load_model(
-        model_path,
-        draft_model=config.draft_model.model_dump(include={"draft_model_dir"}),
-    )
-
+    # Load the model and also add draft dir with API request flag
+    try:
+        logger.info(f"Starting model switch to '{model_name}'")
+        await model.load_model(
+            model_path,
+            is_api_request=True,  # Flag this as an API request to skip the progress bar
+            draft_model=config.draft_model.model_dump(include={"draft_model_dir"}),
+        )
+        logger.info(f"Successfully switched to model '{model_name}'")
+    except Exception as e:
+        error_message = handle_request_error(
+            f"Failed to load model '{model_name}': {str(e)}",
+            exc_info=True,
+        ).error.message
+        raise HTTPException(503, error_message)
 
 async def stream_generate_completion(
     data: CompletionRequest, request: Request, model_path: pathlib.Path

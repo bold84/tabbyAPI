@@ -55,6 +55,11 @@ model:
   # This method of loading is strict by default.
   # Enable dummy models to add exceptions for invalid model names.
   inline_model_loading: false
+  
+  # When true, model switch requests will wait for active generations to complete (default: False).
+  # When false, requests will be rejected immediately with an error if generations are in progress.
+  # Only applies when inline_model_loading is enabled.
+  queue_model_switch_requests: false
 
   # Sends dummy model names when the models endpoint is queried. (default: False)
   # Enable this if the client is looking for specific OAI models.

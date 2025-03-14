@@ -153,6 +153,14 @@ class ModelConfig(BaseConfigModel):
             "Enable dummy models to add exceptions for invalid model names."
         ),
     )
+    queue_model_switch_requests: Optional[bool] = Field(
+        False,
+        description=(
+            "When true, model switch requests will wait for active generations to complete (default: False).\n"
+            "When false, requests will be rejected immediately with an error if generations are in progress.\n"
+            "Only applies when inline_model_loading is enabled."
+        ),
+    )
     use_dummy_models: Optional[bool] = Field(
         False,
         description=(
