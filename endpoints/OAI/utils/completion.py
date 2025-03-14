@@ -32,53 +32,6 @@ from endpoints.OAI.types.completion import (
 )
 from endpoints.OAI.types.common import UsageStats
 
-async def _force_cuda_memory_cleanup():
-    """Force aggressive CUDA memory cleanup to address fragmentation issues and memory leaks"""
-    
-    # First run garbage collection to clear Python references
-    gc.collect()
-    
-    try:
-        # For each GPU device
-        for device_idx in range(torch.cuda.device_count()):
-            with torch.cuda.device(device_idx):
-                # First empty cache
-                torch.cuda.empty_cache()
-                
-                # Force synchronization
-                torch.cuda.synchronize()
-                
-                # Get free memory
-                free_memory = torch.cuda.get_device_properties(device_idx).total_memory - torch.cuda.memory_allocated(device_idx)
-                
-                try:
-                    # Try allocating and immediately freeing 90% of free memory
-                    # This can help consolidate memory fragments
-                    if free_memory > 256 * 1024 * 1024:  # Only if >256MB free
-                        tensor_size = int(free_memory * 0.9)
-                        logger.info(f"Defragmenting CUDA memory on device {device_idx} ({tensor_size/1024**2:.1f}MB)")
-                        temp_tensor = torch.empty(tensor_size, dtype=torch.uint8, device=f"cuda:{device_idx}")
-                        del temp_tensor
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                except Exception as e:
-                    logger.warning(f"Error during defragmentation on GPU {device_idx}: {str(e)}")
-                
-                # Try a second empty cache call
-                torch.cuda.empty_cache()
-        
-        # Add an explicit delay to allow async CUDA operations to complete
-        await asyncio.sleep(2)
-        
-        # One final cleanup pass
-        for device_idx in range(torch.cuda.device_count()):
-            with torch.cuda.device(device_idx):
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-        
-        gc.collect()
-    except Exception as e:
-        logger.warning(f"Error during CUDA memory cleanup: {str(e)}")
 
 def _create_response(
     request_id: str, generations: Union[dict, List[dict]], model_name: str = ""
@@ -316,27 +269,25 @@ async def load_inline_model(model_name: str, request: Request):
             # Always unload first and wait for memory to be freed
             if model.container and model.container.model_loaded and attempt == 1:
                 logger.info(f"Unloading existing model.")
-                await model.unload_model(skip_wait=True)
+                # Only pass parameters that unload_model accepts
+                # Set shutdown=False to ensure we don't cancel client jobs
+                logger.info(f"Unloading existing model before switching to '{model_name}'...")
+                await model.unload_model(skip_wait=False, shutdown=False)
                 
-                # Explicitly ensure CUDA memory is freed before continuing
-                from common.model import ensure_cuda_memory_freed
-                await ensure_cuda_memory_freed()
+                # The unload method now has a built-in delay to ensure resources are freed
+                logger.info("Model unload completed, preparing to load new model...")
                 
             # If this is a retry, run additional cleanup
             if attempt > 1:
                 logger.info(f"Running additional memory cleanup before retry {attempt}")
                 
-                # Clear memory again
+                # More aggressive cleanup for retry attempts
+                logger.info(f"Retry attempt {attempt} - running additional cleanup...")
                 gc.collect()
-                torch.cuda.empty_cache()
                 
-                # Allow time for CUDA operations to complete
-                for device_idx in range(torch.cuda.device_count()):
-                    with torch.cuda.device(device_idx):
-                        torch.cuda.synchronize()
-                
-                # Sleep to allow OS memory management to catch up
-                await asyncio.sleep(2)
+                # Longer delay for retry attempts to ensure resources are fully freed
+                logger.info(f"Waiting for resources to be freed before retry attempt {attempt}...")
+                await asyncio.sleep(5)
                 
             model_path = pathlib.Path(config.model.model_dir) / model_name
             await model.load_model(
@@ -354,10 +305,6 @@ async def load_inline_model(model_name: str, request: Request):
             # Only retry for VRAM errors
             if is_vram_error and attempt < max_attempts:
                 logger.warning(f"VRAM error during model load attempt {attempt}, will retry: {str(e)}")
-                
-                # Additional cleanup between attempts
-                gc.collect()
-                torch.cuda.empty_cache()
                 
                 # Allow some time before retrying
                 await asyncio.sleep(5)
@@ -443,7 +390,7 @@ async def generate_completion(
     gen_tasks: List[asyncio.Task] = []
 
     try:
-        logger.info(f"Recieved completion request {request.state.id}")
+        logger.info(f"Received completion request {request.state.id}")
 
         for _ in range(0, data.n):
             task_gen_params = data.model_copy(deep=True)

@@ -5,6 +5,7 @@ import asyncio
 import gc
 import math
 import pathlib
+import time
 import traceback
 from backends.exllamav2.vision import clear_image_embedding_cache
 from common.multimodal import MultimodalEmbeddingWrapper
@@ -524,37 +525,76 @@ class ExllamaV2Container:
 
         return model_params
 
-    async def wait_for_jobs(self, skip_wait: bool = False):
-        """Polling mechanism to wait for pending generation jobs."""
+    async def wait_for_jobs(self, skip_wait: bool = False, shutdown: bool = False):
+        """
+        Polling mechanism to wait for pending generation jobs.
+        
+        Args:
+            skip_wait: If True, don't wait for jobs to complete naturally
+            shutdown: If True, this is being called during server shutdown and jobs can be cancelled
+        """
 
-        if not self.generator:
+        if not self.generator or not hasattr(self.generator, "jobs"):
+            return
+            
+        # If no jobs, return immediately
+        if not self.generator.jobs:
             return
 
-        # Immediately abort all jobs if asked
-        if skip_wait:
+        # Only cancel jobs during shutdown or if explicitly requested AND no clients are affected
+        if shutdown and skip_wait:
             logger.warning(
-                "Immediately terminating all jobs. "
+                "Server shutdown in progress. Terminating all jobs. "
                 "Clients will have their requests cancelled.\n"
             )
 
             # Requires a copy to avoid errors during iteration
-            if hasattr(self.generator, "jobs"):
-                jobs_copy = self.generator.jobs.copy()
-                cancel_tasks = []
-                for job in jobs_copy.values():
-                    cancel_tasks.append(asyncio.create_task(job.cancel()))
-                
-                if cancel_tasks:
-                    await asyncio.gather(*cancel_tasks)
-                    # Add a small delay to ensure cleanup completes
-                    await asyncio.sleep(0.5)
-        else:
-            # Wait for all jobs to complete naturally
-            while self.generator and hasattr(self.generator, "jobs") and self.generator.jobs:
-                await asyncio.sleep(0.1)
+            jobs_copy = self.generator.jobs.copy()
+            cancel_tasks = []
+            for job in jobs_copy.values():
+                cancel_tasks.append(asyncio.create_task(job.cancel()))
             
-            # Add a small delay to ensure cleanup completes even for natural completion
-            await asyncio.sleep(0.5)
+            if cancel_tasks:
+                await asyncio.gather(*cancel_tasks)
+                # Add a small delay to ensure cleanup completes
+                await asyncio.sleep(0.5)
+        else:
+            # For normal operation or model switching, wait for jobs to complete naturally
+            job_count = len(self.generator.jobs)
+            if job_count > 0:
+                logger.info(f"Waiting for {job_count} active generation jobs to complete...")
+                
+                # Wait for all jobs to complete naturally with a reasonable timeout
+                max_wait_time = 300  # 5 minutes max wait
+                start_time = time.time()
+                
+                while self.generator and hasattr(self.generator, "jobs") and self.generator.jobs:
+                    # Log progress periodically
+                    if self.generator.jobs and (time.time() - start_time) % 10 < 0.1:  # Log every ~10 seconds
+                        remaining = len(self.generator.jobs)
+                        logger.info(f"Still waiting for {remaining} generation jobs to complete...")
+                    
+                    # Check for timeout
+                    if time.time() - start_time > max_wait_time:
+                        logger.warning(f"Timed out after {max_wait_time}s waiting for jobs to complete")
+                        if shutdown:  # Only force cancel on shutdown after timeout
+                            logger.warning("Forcing cancellation of remaining jobs due to shutdown")
+                            jobs_copy = self.generator.jobs.copy()
+                            cancel_tasks = []
+                            for job in jobs_copy.values():
+                                cancel_tasks.append(asyncio.create_task(job.cancel()))
+                            
+                            if cancel_tasks:
+                                await asyncio.gather(*cancel_tasks)
+                        break
+                    
+                    await asyncio.sleep(0.1)
+                
+                # Add a small delay to ensure cleanup completes even for natural completion
+                await asyncio.sleep(0.5)
+                
+                if not self.generator.jobs:
+                    logger.info("All generation jobs completed successfully")
 
     async def load(self, progress_callback=None):
         """
@@ -583,8 +623,11 @@ class ExllamaV2Container:
             # Remove API request flag from kwargs to avoid passing it to other functions
             is_api_request = kwargs.pop("is_api_request", False)
 
+            # Filter kwargs to only include parameters that wait_for_jobs accepts
+            skip_wait = kwargs.get("skip_wait", False)
+            
             # Wait for existing generation jobs to finish
-            await self.wait_for_jobs(kwargs.get("skip_wait"))
+            await self.wait_for_jobs(skip_wait)
 
             # Streaming gen for model load progress
             model_load_generator = self.load_model_sync(progress_callback)
@@ -602,9 +645,8 @@ class ExllamaV2Container:
                 # Create async generator
                 await self.create_generator()
                 
-                # Clean up any extra vram usage from torch and cuda
+                # Let garbage collection handle cleanup
                 gc.collect()
-                torch.cuda.empty_cache()
                 
                 # Cleanup and update model load state
                 self.model_loaded = True
@@ -613,12 +655,12 @@ class ExllamaV2Container:
                 logger.error(f"Error loading model: {str(e)}")
                 # Attempt to clean up any partially loaded model
                 try:
+                    # Let the model's unload methods handle cleanup
                     if self.model:
                         self.model.unload()
                     if self.draft_model:
                         self.draft_model.unload()
                     gc.collect()
-                    torch.cuda.empty_cache()
                 except Exception as cleanup_error:
                     logger.error(f"Error during cleanup: {str(cleanup_error)}")
                 raise e
@@ -823,8 +865,8 @@ class ExllamaV2Container:
             if self.model_loaded:
                 await self.load_lock.acquire()
 
-                # Immediately cancel all jobs
-                await self.wait_for_jobs(skip_wait=True)
+                # Only cancel jobs during shutdown, not during normal generator recreation
+                await self.wait_for_jobs(skip_wait=True, shutdown=False)
 
             # Ensure we have the necessary components before creating generator
             if not self.model or not self.cache or not self.tokenizer:
@@ -921,8 +963,11 @@ class ExllamaV2Container:
             if not do_shutdown:
                 await self.load_lock.acquire()
 
+                # Extract only the parameters we need
+                skip_wait = kwargs.get("skip_wait", False)
+                
                 # Wait for other jobs to finish with a generous timeout
-                await self.wait_for_jobs(kwargs.get("skip_wait"))
+                await self.wait_for_jobs(skip_wait)
 
             # Delete references held in the grammar module
             clear_grammar_func_cache()
@@ -1005,28 +1050,18 @@ class ExllamaV2Container:
                     except Exception as e:
                         logger.warning(f"Error unloading draft model: {str(e)}")
 
-                # Run garbage collection after explicitly nullifying references
+                # Detailed logging and cleanup sequence
+                logger.info("Starting final cleanup sequence...")
+                
+                # Run garbage collection
                 gc.collect()
                 
-                # More aggressive CUDA memory cleanup - SYNCHRONOUS
-                try:
-                    # First empty the cache
-                    torch.cuda.empty_cache()
-                    
-                    # Forcefully synchronize all devices to ensure operations complete
-                    for device_idx in range(torch.cuda.device_count()):
-                        with torch.cuda.device(device_idx):
-                            torch.cuda.synchronize()
-                    
-                    # Give CUDA driver a moment to clean up
-                    await asyncio.sleep(1)
-                    
-                    # Second empty cache call after sync and sleep
-                    torch.cuda.empty_cache()
-                except Exception as e:
-                    logger.warning(f"Error during CUDA cleanup: {str(e)}")
-
-                logger.info("Model unloaded.")
+                # Add a delay to ensure all resources are properly freed
+                # This is critical for model switching to work reliably
+                logger.info("Waiting for resources to be freed (3 seconds)...")
+                await asyncio.sleep(3)
+                
+                logger.info("Model unload sequence completed successfully.")
             else:
                 logger.info("Loras unloaded.")
         finally:

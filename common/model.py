@@ -5,7 +5,6 @@ Containers exist as a common interface for backends.
 """
 
 import asyncio
-import time
 import gc
 import pathlib
 from enum import Enum
@@ -66,11 +65,14 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
                 f'Model "{loaded_model_name}" is already loaded! Aborting.'
             )
 
-        logger.info("Unloading existing model.")
-        await unload_model(**kwargs)
+        # Remove API request flag and other parameters that unload_model doesn't accept
+        unload_kwargs = {k: v for k, v in kwargs.items() if k in ['skip_wait', 'shutdown']}
         
-        # Wait for CUDA memory to be freed before proceeding
-        await ensure_cuda_memory_freed()
+        logger.info("Unloading existing model.")
+        await unload_model(**unload_kwargs)
+        
+        # The unload method now has a built-in delay to ensure resources are freed
+        logger.info("Preparing to load new model...")
 
     # Merge with config defaults
     kwargs = {**config.model_defaults, **kwargs}
@@ -215,81 +217,4 @@ async def check_embeddings_container():
 
         raise HTTPException(400, error_message)
 
-async def ensure_cuda_memory_freed(timeout=10):
-    """
-    Wait for CUDA operations to complete and memory to be freed
-    with timeout protection
-    """
-    logger.info("Ensuring CUDA memory is freed before proceeding...")
-    
-    # Force synchronization on all devices first
-    for device_idx in range(torch.cuda.device_count()):
-        with torch.cuda.device(device_idx):
-            torch.cuda.synchronize()
-    
-    # First empty cache and run garbage collection
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    # Record starting allocated memory per device
-    start_time = time.time()
-    initial_allocated = {
-        i: torch.cuda.memory_allocated(i) 
-        for i in range(torch.cuda.device_count())
-    }
-    
-    # Record starting reserved memory per device
-    initial_reserved = {
-        i: torch.cuda.memory_reserved(i) 
-        for i in range(torch.cuda.device_count())
-    }
-    
-    # Wait for memory to be freed, with timeout
-    while time.time() - start_time < timeout:
-        # Force synchronization on all devices
-        for device_idx in range(torch.cuda.device_count()):
-            with torch.cuda.device(device_idx):
-                torch.cuda.synchronize()
-        
-        # Run empty_cache again
-        torch.cuda.empty_cache()
-        
-        # Check if memory has been freed on all devices
-        all_freed = True
-        for device_idx in range(torch.cuda.device_count()):
-            current_allocated = torch.cuda.memory_allocated(device_idx)
-            current_reserved = torch.cuda.memory_reserved(device_idx)
-            
-            # Check if allocated or reserved memory has decreased
-            if (current_allocated >= initial_allocated[device_idx] and 
-                current_reserved >= initial_reserved[device_idx]):
-                all_freed = False
-                break
-            
-            # Update our tracking values
-            initial_allocated[device_idx] = current_allocated
-            initial_reserved[device_idx] = current_reserved
-        
-        # If memory has decreased on all devices, we can exit
-        if all_freed:
-            # One final cleanup and sync
-            gc.collect()
-            for device_idx in range(torch.cuda.device_count()):
-                with torch.cuda.device(device_idx):
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-            
-            logger.info("CUDA memory has been freed successfully")
-            return
-        
-        # Wait a bit before checking again
-        await asyncio.sleep(0.5)
-    
-    # If we've reached here, we've timed out
-    logger.warning(f"Timed out after {timeout}s waiting for CUDA memory to be freed")
-    
-    # Log memory status for debugging
-    for device_idx in range(torch.cuda.device_count()):
-        allocated_mb = torch.cuda.memory_allocated(device_idx) / (1024 * 1024)
-        reserved_mb = torch.cuda.memory_reserved(device_idx) / (1024 * 1024)
-        logger.warning(f"GPU {device_idx}: {allocated_mb:.2f}MB allocated, {reserved_mb:.2f}MB reserved")
+# Function removed - relying on ExLlamaV2's unload methods instead
