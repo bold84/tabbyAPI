@@ -921,7 +921,7 @@ class ExllamaV2Container:
             if not do_shutdown:
                 await self.load_lock.acquire()
 
-                # Wait for other jobs to finish
+                # Wait for other jobs to finish with a generous timeout
                 await self.wait_for_jobs(kwargs.get("skip_wait"))
 
             # Delete references held in the grammar module
@@ -944,6 +944,8 @@ class ExllamaV2Container:
                 temp_vision_model = self.vision_model
                 temp_draft_model = self.draft_model
                 temp_generator = self.generator
+                temp_cache = self.cache
+                temp_draft_cache = self.draft_cache
                 
                 # Nullify references first to prevent any new accesses
                 self.model = None
@@ -951,6 +953,7 @@ class ExllamaV2Container:
                 self.draft_model = None
                 self.config = None
                 self.cache = None
+                self.draft_cache = None
                 self.tokenizer = None
                 
                 # Set all model state variables to False before actual unloading
@@ -963,24 +966,65 @@ class ExllamaV2Container:
                     # Explicitly set to None after closing
                     self.generator = None
 
+                # Clean up cache objects first
+                if temp_cache:
+                    try:
+                        # Some caches have explicit free methods
+                        if hasattr(temp_cache, "free"):
+                            temp_cache.free()
+                    except Exception as e:
+                        logger.warning(f"Error freeing cache: {str(e)}")
+                        
+                if temp_draft_cache:
+                    try:
+                        if hasattr(temp_draft_cache, "free"):
+                            temp_draft_cache.free()
+                    except Exception as e:
+                        logger.warning(f"Error freeing draft cache: {str(e)}")
+
                 # Then clean up the actual model objects
                 if temp_model:
-                    temp_model.unload()
+                    try:
+                        temp_model.unload()
+                    except Exception as e:
+                        logger.warning(f"Error unloading model: {str(e)}")
                     
                 if temp_vision_model:
-                    # TODO: Remove this with newer exl2 versions
-                    # Required otherwise unload function won't finish
                     try:
                         temp_vision_model.unload()
                     except AttributeError:
+                        # TODO: Remove this with newer exl2 versions
+                        # Required otherwise unload function won't finish
                         pass
+                    except Exception as e:
+                        logger.warning(f"Error unloading vision model: {str(e)}")
 
                 if temp_draft_model:
-                    temp_draft_model.unload()
+                    try:
+                        temp_draft_model.unload()
+                    except Exception as e:
+                        logger.warning(f"Error unloading draft model: {str(e)}")
 
                 # Run garbage collection after explicitly nullifying references
                 gc.collect()
-                torch.cuda.empty_cache()
+                
+                # More aggressive CUDA memory cleanup - SYNCHRONOUS
+                try:
+                    # First empty the cache
+                    torch.cuda.empty_cache()
+                    
+                    # Forcefully synchronize all devices to ensure operations complete
+                    for device_idx in range(torch.cuda.device_count()):
+                        with torch.cuda.device(device_idx):
+                            torch.cuda.synchronize()
+                    
+                    # Give CUDA driver a moment to clean up
+                    await asyncio.sleep(1)
+                    
+                    # Second empty cache call after sync and sleep
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                    logger.warning(f"Error during CUDA cleanup: {str(e)}")
 
                 logger.info("Model unloaded.")
             else:
@@ -991,8 +1035,7 @@ class ExllamaV2Container:
 
                 async with self.load_condition:
                     self.load_condition.notify_all()
-
-
+                
     def encode_tokens(self, text: str, **kwargs):
         """Wrapper to encode tokens from a text string."""
 
@@ -1020,9 +1063,13 @@ class ExllamaV2Container:
         )[0]
 
     # TODO: Maybe support generation_config for eos_token
-    def get_special_tokens(
-        self, add_bos_token: bool = True, ban_eos_token: bool = False
-    ):
+    def get_special_tokens(self, add_bos_token: bool = True, ban_eos_token: bool = False):
+        # Ensure the model is fully loaded before returning tokens.
+        if not self.model_loaded or self.model_is_loading or self.tokenizer is None:
+            raise RuntimeError(
+                "Model (or tokenizer) is not fully loaded because a model switch is in progress. "
+                "Please try again later."
+            )
         return {
             "bos_token": self.tokenizer.bos_token if add_bos_token else "",
             "eos_token": self.tokenizer.eos_token if not ban_eos_token else "",

@@ -5,7 +5,9 @@ Also serves as a common module for completions and chat completions.
 """
 
 import asyncio
+import gc
 import pathlib
+import torch
 from asyncio import CancelledError
 from fastapi import HTTPException, Request
 from typing import List, Union
@@ -30,6 +32,53 @@ from endpoints.OAI.types.completion import (
 )
 from endpoints.OAI.types.common import UsageStats
 
+async def _force_cuda_memory_cleanup():
+    """Force aggressive CUDA memory cleanup to address fragmentation issues and memory leaks"""
+    
+    # First run garbage collection to clear Python references
+    gc.collect()
+    
+    try:
+        # For each GPU device
+        for device_idx in range(torch.cuda.device_count()):
+            with torch.cuda.device(device_idx):
+                # First empty cache
+                torch.cuda.empty_cache()
+                
+                # Force synchronization
+                torch.cuda.synchronize()
+                
+                # Get free memory
+                free_memory = torch.cuda.get_device_properties(device_idx).total_memory - torch.cuda.memory_allocated(device_idx)
+                
+                try:
+                    # Try allocating and immediately freeing 90% of free memory
+                    # This can help consolidate memory fragments
+                    if free_memory > 256 * 1024 * 1024:  # Only if >256MB free
+                        tensor_size = int(free_memory * 0.9)
+                        logger.info(f"Defragmenting CUDA memory on device {device_idx} ({tensor_size/1024**2:.1f}MB)")
+                        temp_tensor = torch.empty(tensor_size, dtype=torch.uint8, device=f"cuda:{device_idx}")
+                        del temp_tensor
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                except Exception as e:
+                    logger.warning(f"Error during defragmentation on GPU {device_idx}: {str(e)}")
+                
+                # Try a second empty cache call
+                torch.cuda.empty_cache()
+        
+        # Add an explicit delay to allow async CUDA operations to complete
+        await asyncio.sleep(2)
+        
+        # One final cleanup pass
+        for device_idx in range(torch.cuda.device_count()):
+            with torch.cuda.device(device_idx):
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        
+        gc.collect()
+    except Exception as e:
+        logger.warning(f"Error during CUDA memory cleanup: {str(e)}")
 
 def _create_response(
     request_id: str, generations: Union[dict, List[dict]], model_name: str = ""
@@ -166,81 +215,70 @@ async def load_inline_model(model_name: str, request: Request):
         ).error.message
         raise HTTPException(503, error_message)
 
-    # Check if active generations are in progress
-    active_jobs = {}
-    if model.container and model.container.generator and hasattr(model.container.generator, "jobs"):
-        active_jobs = model.container.generator.jobs
-        
-    if active_jobs:
-        current_model_name = model.container.model_dir.name
-        job_count = len(active_jobs)
-        
-        logger.info(f"Model switch request detected {job_count} active generation jobs")
-        
-        # Check if we should queue or reject based on config setting
-        if not config.model.queue_model_switch_requests:
-            # Reject with error
-            error_message = handle_request_error(
-                f"Cannot switch models while active generations are in progress with model '{current_model_name}'. "
-                f"Requested model '{model_name}' will not be loaded. Please try again later.",
-                exc_info=False,
-            ).error.message
-            raise HTTPException(503, error_message)
-        else:
-            # Wait for active jobs WITHOUT holding the load_lock
-            logger.info(
-                f"Request to switch from '{current_model_name}' to '{model_name}' is waiting for "
-                f"{job_count} active generations to complete."
-            )
+    # Check if we should queue or reject based on config setting
+    if config.model.queue_model_switch_requests:
+        # Get current generation jobs if they exist
+        if model.container and model.container.generator and hasattr(model.container.generator, "jobs"):
+            active_jobs = model.container.generator.jobs
+            current_model_name = model.container.model_dir.name if model.container.model_dir else "unknown"
             
-            # Create a copy of active job IDs
-            active_job_ids = list(active_jobs.keys())
-            
-            # Wait for all active jobs to complete (with timeout protection)
-            max_wait_time = 300  # 5 minutes max wait
-            start_time = asyncio.get_event_loop().time()
-            
-            while active_job_ids and (asyncio.get_event_loop().time() - start_time < max_wait_time):
-                # Get current jobs
-                current_jobs = getattr(model.container.generator, "jobs", {})
-                # Update active job IDs by checking which are still in the generator's jobs dict
-                active_job_ids = [job_id for job_id in active_job_ids if job_id in current_jobs]
+            if active_jobs:
+                job_count = len(active_jobs)
+                logger.info(f"Model switch request detected {job_count} active generation jobs")
                 
-                if not active_job_ids:
-                    logger.info(f"All active generations completed. Proceeding with model switch to '{model_name}'.")
-                    # Add a small delay to ensure generators are fully closed before unloading
-                    await asyncio.sleep(0.5)
-                    break
-                    
-                # Add periodic logging
-                if (asyncio.get_event_loop().time() - start_time) % 10 < 0.1:  # Log every ~10 seconds
-                    logger.info(f"Still waiting for {len(active_job_ids)} generation jobs to complete...")
-                    
-                await asyncio.sleep(0.1)  # Short sleep to prevent CPU spinning
+                # Wait for active jobs WITHOUT holding the load_lock
+                logger.info(
+                    f"Request to switch from '{current_model_name}' to '{model_name}' is waiting for "
+                    f"{job_count} active generations to complete."
+                )
                 
-            # If we timed out
-            if active_job_ids:
+                # Create a copy of active job IDs
+                active_job_ids = list(active_jobs.keys())
+                
+                # Wait for all active jobs to complete (with timeout protection)
+                max_wait_time = 300  # 5 minutes max wait
+                start_time = asyncio.get_event_loop().time()
+                
+                while active_job_ids and (asyncio.get_event_loop().time() - start_time < max_wait_time):
+                    # Get current jobs
+                    current_jobs = getattr(model.container.generator, "jobs", {})
+                    # Update active job IDs by checking which are still in the generator's jobs dict
+                    active_job_ids = [job_id for job_id in active_job_ids if job_id in current_jobs]
+                    
+                    if not active_job_ids:
+                        logger.info(f"All active generations completed. Proceeding with model switch to '{model_name}'.")
+                        # Add a small delay to ensure generators are fully closed before unloading
+                        await asyncio.sleep(0.5)
+                        break
+                        
+                    # Add periodic logging
+                    if (asyncio.get_event_loop().time() - start_time) % 10 < 0.1:  # Log every ~10 seconds
+                        logger.info(f"Still waiting for {len(active_job_ids)} generation jobs to complete...")
+                        
+                    await asyncio.sleep(0.1)  # Short sleep to prevent CPU spinning
+                    
+                # If we timed out
+                if active_job_ids:
+                    error_message = handle_request_error(
+                        f"Timed out waiting for active generations to complete. "
+                        f"Cannot switch from '{current_model_name}' to '{model_name}'.",
+                        exc_info=False,
+                    ).error.message
+                    raise HTTPException(504, error_message)  # 504 Gateway Timeout
+    else:
+        # Check if active generations are in progress and reject if present
+        if model.container and model.container.generator and hasattr(model.container.generator, "jobs"):
+            active_jobs = model.container.generator.jobs
+            if active_jobs:
+                current_model_name = model.container.model_dir.name if model.container.model_dir else "unknown"
+                job_count = len(active_jobs)
                 error_message = handle_request_error(
-                    f"Timed out waiting for active generations to complete. "
-                    f"Cannot switch from '{current_model_name}' to '{model_name}'.",
+                    f"Cannot switch models while active generations are in progress with model '{current_model_name}'. "
+                    f"Requested model '{model_name}' will not be loaded. Please try again later.",
                     exc_info=False,
                 ).error.message
-                raise HTTPException(504, error_message)  # 504 Gateway Timeout
+                raise HTTPException(503, error_message)
 
-    # Force a re-check of active jobs to ensure nothing started while we were waiting
-    if hasattr(model.container, "generator") and hasattr(model.container.generator, "jobs"):
-        active_jobs = model.container.generator.jobs
-        if active_jobs:
-            job_count = len(active_jobs)
-            current_model_name = model.container.model_dir.name
-            error_message = handle_request_error(
-                f"New generations started while waiting for switch. "
-                f"Cannot switch from '{current_model_name}' to '{model_name}' "
-                f"with {job_count} active jobs.",
-                exc_info=False,
-            ).error.message
-            raise HTTPException(503, error_message)
-    
     model_path = pathlib.Path(config.model.model_dir)
     model_path = model_path / model_name
 
@@ -251,21 +289,86 @@ async def load_inline_model(model_name: str, request: Request):
         )
         return
 
-    # Load the model and also add draft dir with API request flag
-    try:
-        logger.info(f"Starting model switch to '{model_name}'")
-        await model.load_model(
-            model_path,
-            is_api_request=True,  # Flag this as an API request to skip the progress bar
-            draft_model=config.draft_model.model_dump(include={"draft_model_dir"}),
-        )
-        logger.info(f"Successfully switched to model '{model_name}'")
-    except Exception as e:
-        error_message = handle_request_error(
-            f"Failed to load model '{model_name}': {str(e)}",
-            exc_info=True,
-        ).error.message
-        raise HTTPException(503, error_message)
+    # Final safety check right before we unload the current model
+    if model.container and model.container.generator and hasattr(model.container.generator, "jobs"):
+        active_jobs = model.container.generator.jobs
+        if active_jobs:
+            current_model_name = model.container.model_dir.name if model.container.model_dir else "unknown"
+            job_count = len(active_jobs)
+            error_message = handle_request_error(
+                f"New generations started while waiting for switch. "
+                f"Cannot switch from '{current_model_name}' to '{model_name}' "
+                f"with {job_count} active jobs.",
+                exc_info=False,
+            ).error.message
+            raise HTTPException(503, error_message)
+    
+    # Load the model with retry logic
+    max_attempts = 3
+    attempt = 0
+    
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            logger.info(f"Starting model switch to '{model_name}'" + 
+                      (f" (attempt {attempt}/{max_attempts})" if attempt > 1 else ""))
+            
+            # Always unload first and wait for memory to be freed
+            if model.container and model.container.model_loaded and attempt == 1:
+                logger.info(f"Unloading existing model.")
+                await model.unload_model(skip_wait=True)
+                
+                # Explicitly ensure CUDA memory is freed before continuing
+                from common.model import ensure_cuda_memory_freed
+                await ensure_cuda_memory_freed()
+                
+            # If this is a retry, run additional cleanup
+            if attempt > 1:
+                logger.info(f"Running additional memory cleanup before retry {attempt}")
+                
+                # Clear memory again
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                # Allow time for CUDA operations to complete
+                for device_idx in range(torch.cuda.device_count()):
+                    with torch.cuda.device(device_idx):
+                        torch.cuda.synchronize()
+                
+                # Sleep to allow OS memory management to catch up
+                await asyncio.sleep(2)
+                
+            model_path = pathlib.Path(config.model.model_dir) / model_name
+            await model.load_model(
+                model_path,
+                is_api_request=True,  # Flag this as an API request to skip the progress bar
+                draft_model=config.draft_model.model_dump(include={"draft_model_dir"}),
+            )
+            logger.info(f"Successfully switched to model '{model_name}'")
+            return  # Success, exit the retry loop
+            
+        except Exception as e:
+            last_error = e
+            is_vram_error = "Insufficient VRAM" in str(e) or "CUDA out of memory" in str(e)
+            
+            # Only retry for VRAM errors
+            if is_vram_error and attempt < max_attempts:
+                logger.warning(f"VRAM error during model load attempt {attempt}, will retry: {str(e)}")
+                
+                # Additional cleanup between attempts
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                # Allow some time before retrying
+                await asyncio.sleep(5)
+                continue
+            else:
+                # Either not a VRAM error or we've exhausted our retries
+                error_message = handle_request_error(
+                    f"Failed to load model '{model_name}': {str(e)}",
+                    exc_info=True,
+                ).error.message
+                raise HTTPException(503, error_message)
 
 async def stream_generate_completion(
     data: CompletionRequest, request: Request, model_path: pathlib.Path
