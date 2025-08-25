@@ -1,7 +1,7 @@
-from pathlib import Path
 from pydantic import (
     BaseModel,
     ConfigDict,
+    constr,
     Field,
     PrivateAttr,
     field_validator,
@@ -10,6 +10,7 @@ from typing import List, Literal, Optional, Union
 
 
 CACHE_SIZES = Literal["FP16", "Q8", "Q6", "Q4"]
+CACHE_TYPE = Union[CACHE_SIZES, constr(pattern=r"^[2-8]\s*,\s*[2-8]$")]
 
 
 class Metadata(BaseModel):
@@ -30,28 +31,6 @@ class ConfigOverrideConfig(BaseConfigModel):
     # TODO: convert this to a pathlib.path?
     config: Optional[str] = Field(
         None, description=("Path to an overriding config.yml file")
-    )
-
-    _metadata: Metadata = PrivateAttr(Metadata(include_in_config=False))
-
-
-class UtilityActions(BaseConfigModel):
-    """Model used for arg actions."""
-
-    # YAML export options
-    export_config: Optional[str] = Field(
-        None, description="generate a template config file"
-    )
-    config_export_path: Optional[Path] = Field(
-        "config_sample.yml", description="path to export configuration file to"
-    )
-
-    # OpenAPI JSON export options
-    export_openapi: Optional[bool] = Field(
-        False, description="export openapi schema files"
-    )
-    openapi_export_path: Optional[Path] = Field(
-        "openapi.json", description="path to export openapi schema to"
     )
 
     _metadata: Metadata = PrivateAttr(Metadata(include_in_config=False))
@@ -186,20 +165,36 @@ class ModelConfig(BaseConfigModel):
             "Example: ['max_seq_len', 'cache_mode']."
         ),
     )
+    backend: Optional[str] = Field(
+        None,
+        description=(
+            "Backend to use for this model (auto-detect if not specified)\n"
+            "Options: exllamav2, exllamav3"
+        ),
+    )
     max_seq_len: Optional[int] = Field(
         None,
         description=(
-            "Max sequence length (default: Empty).\n"
-            "Fetched from the model's base sequence length in config.json by default."
+            "Max sequence length (default: 4096).\n"
+            "Set to -1 to fetch from the model's config.json"
         ),
-        ge=0,
+        ge=-1,
     )
     tensor_parallel: Optional[bool] = Field(
         False,
         description=(
-            "Load model with tensor parallelism.\n"
+            "Load model with tensor parallelism (default: False).\n"
             "Falls back to autosplit if GPU split isn't provided.\n"
             "This ignores the gpu_split_auto value."
+        ),
+    )
+    tensor_parallel_backend: Optional[str] = Field(
+        "native",
+        description=(
+            "Sets a backend type for tensor parallelism. (default: native).\n"
+            "Options: native, nccl\n"
+            "Native is recommended for PCIe GPUs\n"
+            "NCCL is recommended for NVLink."
         ),
     )
     gpu_split_auto: Optional[bool] = Field(
@@ -209,7 +204,7 @@ class ModelConfig(BaseConfigModel):
             "Not parsed for single GPU users."
         ),
     )
-    autosplit_reserve: List[int] = Field(
+    autosplit_reserve: List[float] = Field(
         [96],
         description=(
             "Reserve VRAM used for autosplit loading (default: 96 MB on GPU 0).\n"
@@ -241,11 +236,13 @@ class ModelConfig(BaseConfigModel):
             "or auto-calculate."
         ),
     )
-    cache_mode: Optional[CACHE_SIZES] = Field(
+    cache_mode: Optional[CACHE_TYPE] = Field(
         "FP16",
         description=(
             "Enable different cache modes for VRAM savings (default: FP16).\n"
-            f"Possible values: {str(CACHE_SIZES)[15:-1]}."
+            f"Possible values for exllamav2: {str(CACHE_SIZES)[15:-1]}.\n"
+            "For exllamav3, specify the pair k_bits,v_bits where k_bits and v_bits "
+            "are integers from 2-8 (i.e. 8,8)."
         ),
     )
     cache_size: Optional[int] = Field(
@@ -293,16 +290,6 @@ class ModelConfig(BaseConfigModel):
         description=(
             "Enables vision support if the model supports it. (default: False)"
         ),
-    )
-    num_experts_per_token: Optional[int] = Field(
-        None,
-        description=(
-            "Number of experts to use per token.\n"
-            "Fetched from the model's config.json if empty.\n"
-            "NOTE: For MoE models only.\n"
-            "WARNING: Don't set this unless you know what you're doing!"
-        ),
-        ge=1,
     )
 
     _metadata: Metadata = PrivateAttr(Metadata())
@@ -360,6 +347,23 @@ class DraftModelConfig(BaseConfigModel):
     )
 
 
+class SamplingConfig(BaseConfigModel):
+    """Options for Sampling"""
+
+    override_preset: Optional[str] = Field(
+        None,
+        description=(
+            "Select a sampler override preset (default: None).\n"
+            "Find this in the sampler-overrides folder.\n"
+            "This overrides default fallbacks for sampler values "
+            "that are passed to the API.\n"
+            "NOTE: safe_defaults preset provides a fallback for frontends "
+            "that do not pass sampling params.\n"
+            "Remove it if not necessary."
+        ),
+    )
+
+
 class LoraInstanceModel(BaseConfigModel):
     """Model representing an instance of a Lora."""
 
@@ -413,20 +417,6 @@ class EmbeddingsConfig(BaseConfigModel):
     )
 
 
-class SamplingConfig(BaseConfigModel):
-    """Options for Sampling"""
-
-    override_preset: Optional[str] = Field(
-        None,
-        description=(
-            "Select a sampler override preset (default: None).\n"
-            "Find this in the sampler-overrides folder.\n"
-            "This overrides default fallbacks for sampler values "
-            "that are passed to the API."
-        ),
-    )
-
-
 class DeveloperConfig(BaseConfigModel):
     """Options for development and experimentation"""
 
@@ -440,9 +430,6 @@ class DeveloperConfig(BaseConfigModel):
     )
     disable_request_streaming: Optional[bool] = Field(
         False, description=("Disable API request streaming (default: False).")
-    )
-    cuda_malloc_backend: Optional[bool] = Field(
-        False, description=("Enable the torch CUDA malloc backend (default: False).")
     )
     realtime_process_priority: Optional[bool] = Field(
         False,
@@ -479,9 +466,6 @@ class TabbyConfigModel(BaseModel):
     )
     developer: Optional[DeveloperConfig] = Field(
         default_factory=DeveloperConfig.model_construct
-    )
-    actions: Optional[UtilityActions] = Field(
-        default_factory=UtilityActions.model_construct
     )
 
     model_config = ConfigDict(validate_assignment=True, protected_namespaces=())

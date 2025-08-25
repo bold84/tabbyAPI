@@ -1,6 +1,6 @@
 """Contains model card types."""
 
-from pydantic import AliasChoices, BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict
 from time import time
 from typing import List, Literal, Optional, Union
 
@@ -22,7 +22,6 @@ class ModelCardParameters(BaseModel):
     chunk_size: Optional[int] = 2048
     prompt_template: Optional[str] = None
     prompt_template_content: Optional[str] = None
-    num_experts_per_token: Optional[int] = None
     use_vision: Optional[bool] = False
 
     # Draft is another model, so include it in the card params
@@ -51,10 +50,7 @@ class DraftModelLoadRequest(BaseModel):
     """Represents a draft model load request."""
 
     # Required
-    draft_model_name: str = Field(
-        alias=AliasChoices("draft_model_name", "name"),
-        description="Aliases: name",
-    )
+    draft_model_name: str
 
     # Config arguments
     draft_rope_scale: Optional[float] = None
@@ -76,13 +72,13 @@ class ModelLoadRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=[])
 
     # Required
-    model_name: str = Field(
-        alias=AliasChoices("model_name", "name"),
-        description="Aliases: name",
-    )
+    model_name: str
 
     # Config arguments
-
+    backend: Optional[str] = Field(
+        description="Backend to use",
+        default=None,
+    )
     max_seq_len: Optional[int] = Field(
         description="Leave this blank to use the model's base sequence length",
         default=None,
@@ -94,6 +90,7 @@ class ModelLoadRequest(BaseModel):
         examples=[4096],
     )
     tensor_parallel: Optional[bool] = None
+    tensor_parallel_backend: Optional[str] = "native"
     gpu_split_auto: Optional[bool] = None
     autosplit_reserve: Optional[List[float]] = None
     gpu_split: Optional[List[float]] = Field(
@@ -114,21 +111,14 @@ class ModelLoadRequest(BaseModel):
     chunk_size: Optional[int] = None
     prompt_template: Optional[str] = None
     vision: Optional[bool] = None
-    num_experts_per_token: Optional[int] = None
 
     # Non-config arguments
-    draft_model: Optional[DraftModelLoadRequest] = Field(
-        default=None,
-        alias=AliasChoices("draft_model", "draft"),
-    )
+    draft_model: Optional[DraftModelLoadRequest] = None
     skip_queue: Optional[bool] = False
 
 
 class EmbeddingModelLoadRequest(BaseModel):
-    embedding_model_name: str = Field(
-        alias=AliasChoices("embedding_model_name", "name"),
-        description="Aliases: name",
-    )
+    embedding_model_name: str
 
     # Set default from the config
     embeddings_device: Optional[str] = Field(config.embeddings.embeddings_device)
